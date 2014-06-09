@@ -1,24 +1,72 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
+
 	//"bufio"
 )
 
-func execCmd(cmd *exec.Cmd) (string, bool) {
+var (
+	messageBus string
+)
+
+func sendMessage(msg interface{}) {
+	messageBus += fmt.Sprintf("%s\n", msg)
+}
+
+func sendError(err error) {
+	messageBus += fmt.Sprintf(":ERR %s\n", err)
+}
+
+func execute(cmd *exec.Cmd) (output string, err error) {
 	out, err := cmd.CombinedOutput()
-	var return_str string
 	if err != nil {
-		fmt.Sprintf(return_str, "Error executing command.\n%s", err.Error())
+		sendError(err)
 	} else {
-		return_str = string(out)
+		output = string(out)
 	}
-	return return_str, err==nil
+	return
+}
+
+func writeHaproxyConfig() (err error) {
+	cmd := exec.Command("/var/lib/haproxy/bin/write_haproxy_config")
+	if _, err = execute(cmd); err != nil {
+		sendError(err)
+	}
+	return
+}
+
+func startServer() {
+	cmd := exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid")
+	execute(cmd)
+}
+
+func stopServer() {
+	pid, err := ioutil.ReadFile("/var/lib/haproxy/run/haproxy.pid")
+	if err != nil {
+		cmd := exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid", "-st", string(pid))
+		execute(cmd)
+	}
+}
+
+func reloadServer() (err error) {
+	oldPid, err := ioutil.ReadFile("/var/lib/haproxy/run/haproxy.pid")
+	var cmd *exec.Cmd
+
+	if err != nil {
+		cmd = exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid")
+	} else {
+		cmd = exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid", "-sf", string(oldPid))
+	}
+
+	_, err = execute(cmd)
+	return
 }
 
 func commandServer(c net.Conn) {
@@ -30,42 +78,32 @@ func commandServer(c net.Conn) {
 		}
 
 		data := strings.Trim(string(buf[0:nr]), "\n ")
-		println("Server got:", data)
-		var return_str (string)
-		if data == "Start" {
-			return_str = ":OK\n"
-			cmd := exec.Command("/var/lib/haproxy/bin/write_haproxy_config")
-			execCmd(cmd)
-			cmd = exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid")
-			execCmd(cmd)
-		} else if data == "Stop" {
-			return_str = ":OK\n"
-			cmd := exec.Command("pkill", "haproxy")
-			execCmd(cmd)
-		} else if data == "Reload" {
-			return_str = ":OK\n"
-			cmd := exec.Command("/var/lib/haproxy/bin/write_haproxy_config")
-			out,status := execCmd(cmd)
-			if !status {
-				_, err = c.Write([]byte(out))
+		fmt.Printf("[SERVER] <- '%s'", data)
+
+		switch data {
+		case "Start":
+			sendMessage(":OK")
+			writeHaproxyConfig()
+			startServer()
+		case "Stop":
+			sendMessage(":OK")
+			writeHaproxyConfig()
+			stopServer()
+		case "Reload":
+			sendMessage(":OK")
+			if err := writeHaproxyConfig(); err != nil {
 				continue
 			}
-			old_pid, oerr := ioutil.ReadFile("/var/lib/haproxy/run/haproxy.pid")
-			if oerr != nil {
-				cmd = exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid")
-			} else {
-				cmd = exec.Command("haproxy", "-f", "/var/lib/haproxy/conf/haproxy.config", "-p", "/var/lib/haproxy/run/haproxy.pid", "-sf", string(old_pid))
-			}
-			out,status = execCmd(cmd)
-			return_str = return_str + out
-		} else {
-			return_str = "Command should be one of 'Start/Stop/Reload'"
+			reloadServer()
+		default:
+			sendError(errors.New("Accepted commands: 'Start', 'Stop' and 'Reload'."))
 		}
-		fmt.Printf("Writing %s to socket\n", return_str)
-		_, err = c.Write([]byte(return_str))
+
+		fmt.Printf("[SERVER] -> '%s'", messageBus)
+		_, err = c.Write([]byte(messageBus))
+		messageBus = ""
 		if err != nil {
-			println("Write: ", err.Error())
-			//panic("Write Error.")
+			fmt.Printf("Write error: %s", err)
 		}
 	}
 }
